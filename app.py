@@ -553,18 +553,6 @@ def render_header():
     st.caption(APP_SUBTITLE)
 
 
-def render_document_status(doc_data: dict):
-    st.markdown(
-        f"""
-        <div class="doc-status">
-            <strong>Documento activo:</strong> {doc_data['source_name']}<br>
-            <strong>Fragmentos indexados:</strong> {len(doc_data['chunks'])}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def render_history():
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -598,7 +586,6 @@ def main():
         st.stop()
 
     reset_chat_if_document_changed(doc_data["file_hash"])
-    render_document_status(doc_data)
 
     with st.expander("Cómo responde el asistente", expanded=False):
         st.markdown(
