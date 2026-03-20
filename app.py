@@ -4,13 +4,12 @@ import re
 import time
 import hashlib
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import streamlit as st
 from openai import OpenAI
 
-# Dependencias opcionales
 try:
     from docx import Document
 except Exception:
@@ -22,9 +21,6 @@ except Exception:
     PdfReader = None
 
 
-# ============================================================
-# CONFIGURACIÓN GENERAL
-# ============================================================
 st.set_page_config(
     page_title="Asistente de Atención al Cliente para Guías",
     page_icon="📘",
@@ -43,9 +39,6 @@ CONTACTS_TOP_K = 12
 REPO_DOC_PATH = "pautasattguias.gpt.docx"
 
 
-# ============================================================
-# MODELOS DE DATOS
-# ============================================================
 @dataclass
 class Chunk:
     chunk_id: str
@@ -64,15 +57,16 @@ class RepoFile:
             return f.read()
 
 
-# ============================================================
-# UTILIDADES
-# ============================================================
 def normalize_whitespace(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
+
+def normalize_for_match(text: str) -> str:
+    return normalize_whitespace(text).lower()
 
 
 def file_sha256(file_bytes: bytes) -> str:
@@ -93,13 +87,6 @@ def safe_get_api_key() -> str:
         return ""
 
 
-def normalize_for_match(text: str) -> str:
-    return normalize_whitespace(text).lower()
-
-
-# ============================================================
-# DETECCIÓN DE INTENCIÓN
-# ============================================================
 def detect_intent(question: str) -> str:
     q = question.lower()
 
@@ -107,11 +94,11 @@ def detect_intent(question: str) -> str:
         "accidente", "salud", "médic", "medic", "hospital", "ambul", "emergenc", "urgenc",
         "seguro", "asistencia", "enfermo", "enferma", "doente", "saúde", "acidente",
         "a quién llamo", "a quien llamo", "a dónde llamo", "adónde llamo", "telefono",
-        "teléfono", "número", "numero", "contacto", "llamar", "llamo", "phone"
+        "teléfono", "número", "numero", "contacto", "llamar", "llamo", "phone",
     ]
 
     complaint_terms = [
-        "reclam", "queja", "complaint", "compens", "reembolso", "refund", "indemn"
+        "reclam", "queja", "complaint", "compens", "reembolso", "refund", "indemn",
     ]
 
     if any(term in q for term in critical_terms):
@@ -125,7 +112,7 @@ def detect_online_preference(question: str) -> bool:
     q = question.lower()
     online_terms = [
         "internet", "online", "enlace", "link", "web", "por internet",
-        "llamada por internet", "llamar por internet", "solicitar llamada", "app", "sitio"
+        "llamada por internet", "llamar por internet", "solicitar llamada", "app", "sitio",
     ]
     return any(term in q for term in online_terms)
 
@@ -134,16 +121,19 @@ def detect_query_language(question: str) -> str:
     q = question.strip().lower()
 
     english_markers = [
-        "what", "how", "who", "where", "when", "should", "can i", "do i", "passenger", "customer",
-        "medical", "urgent", "help", "call", "internet", "online", "luggage", "refund"
+        " what ", " how ", " who ", " where ", " when ", " should ", " can i ", " do i ",
+        " passenger ", " customer ", " medical ", " urgent ", " help ", " call ",
+        " luggage ", " refund ", " hotel ", " transfer ",
     ]
     portuguese_markers = [
-        "você", "voce", "passageiro", "ligar", "internet", "saúde", "saude", "reembolso",
-        "bagagem", "ônibus", "onibus", "como", "onde", "quando", "precisa", "preciso", "devo"
+        " você ", " voce ", " passageiro ", " ligar ", " saúde ", " saude ",
+        " reembolso ", " bagagem ", " ônibus ", " onibus ", " preciso ", " devo ",
+        " como ", " onde ", " quando ",
     ]
 
-    english_score = sum(1 for m in english_markers if m in q)
-    portuguese_score = sum(1 for m in portuguese_markers if m in q)
+    padded = f" {q} "
+    english_score = sum(1 for marker in english_markers if marker in padded)
+    portuguese_score = sum(1 for marker in portuguese_markers if marker in padded)
 
     if english_score > portuguese_score and english_score > 0:
         return "english"
@@ -160,12 +150,12 @@ def is_query_in_scope(question: str) -> bool:
         "hotel", "traslado", "transfer", "equipaje", "luggage", "maleta", "bagagem", "seguro",
         "assistance", "asistencia", "atención al cliente", "customer service", "reclam", "queja", "compens",
         "reembolso", "refund", "accidente", "salud", "medical", "médic", "medic", "hospital",
-        "emergenc", "urgenc", "pickup", "meeting point", "coordinator", "coordinador", "localizador"
+        "emergenc", "urgenc", "pickup", "meeting point", "coordinator", "coordinador", "localizador",
     ]
 
     obviously_out_of_scope = [
         "2x2", "capital de", "capital of", "weather", "clima", "tiempo mañana", "football", "fútbol",
-        "recipe", "receta", "programming", "python code", "who won", "cuánto es", "cuanto es"
+        "recipe", "receta", "programming", "python code", "who won", "cuánto es", "cuanto es",
     ]
 
     if any(term in q for term in obviously_out_of_scope):
@@ -174,11 +164,8 @@ def is_query_in_scope(question: str) -> bool:
     return any(term in q for term in travel_scope_terms)
 
 
-# ============================================================
-# EXTRACCIÓN DE TELÉFONOS, ENLACES Y CONTACTOS
-# ============================================================
 def extract_phone_lines(text: str) -> List[str]:
-    lines = []
+    lines: List[str] = []
     phone_pattern = r"\+?\d[\d\s\-()]{6,}\d"
 
     for raw_line in text.splitlines():
@@ -190,13 +177,13 @@ def extract_phone_lines(text: str) -> List[str]:
         has_phone = re.search(phone_pattern, line) is not None
         has_contact_word = any(k in low for k in [
             "tel", "telefono", "teléfono", "phone", "whatsapp", "asistencia", "seguro",
-            "europ assistance", "europassistance", "emergencia", "contacto", "24/7"
+            "europ assistance", "europassistance", "emergencia", "contacto", "24/7",
         ])
 
         if has_phone or has_contact_word:
             lines.append(line)
 
-    dedup = []
+    dedup: List[str] = []
     seen = set()
     for line in lines:
         key = normalize_for_match(line)
@@ -207,7 +194,7 @@ def extract_phone_lines(text: str) -> List[str]:
 
 
 def extract_url_lines(text: str) -> List[str]:
-    lines = []
+    lines: List[str] = []
     url_pattern = r"https?://\S+"
 
     for raw_line in text.splitlines():
@@ -219,13 +206,13 @@ def extract_url_lines(text: str) -> List[str]:
         has_url = re.search(url_pattern, line) is not None
         has_online_word = any(k in low for k in [
             "web", "enlace", "link", "internet", "online", "quickassistance", "eclaims",
-            "solicitar una llamada", "llamada por internet"
+            "solicitar una llamada", "llamada por internet",
         ])
 
         if has_url or has_online_word:
             lines.append(line)
 
-    dedup = []
+    dedup: List[str] = []
     seen = set()
     for line in lines:
         key = normalize_for_match(line)
@@ -243,7 +230,7 @@ def score_contact_relevance(question: str, chunk: Chunk) -> float:
 
     heading_keywords = [
         "contactos críticos", "contactos", "emergencia", "seguro", "europ assistance",
-        "actuación inmediata", "asistencia médica", "mi viaje", "accidente"
+        "actuación inmediata", "asistencia médica", "mi viaje", "accidente",
     ]
     for kw in heading_keywords:
         if kw in text:
@@ -261,7 +248,6 @@ def score_contact_relevance(question: str, chunk: Chunk) -> float:
 
     if extract_phone_lines(chunk.text):
         score += 0.18
-
     if extract_url_lines(chunk.text):
         score += 0.10
 
@@ -280,15 +266,15 @@ def build_priority_contact_block(question: str, retrieved: List[Tuple[Chunk, flo
     if intent != "critical_contact":
         return {"contact_lines": [], "url_lines": [], "contact_chunks": []}
 
-    rescored = []
+    rescored: List[Tuple[Chunk, float]] = []
     for chunk, base_score in retrieved:
         rescored.append((chunk, base_score + score_contact_relevance(question, chunk)))
 
     rescored.sort(key=lambda x: x[1], reverse=True)
 
-    contact_lines = []
-    url_lines = []
-    contact_chunks = []
+    contact_lines: List[str] = []
+    url_lines: List[str] = []
+    contact_chunks: List[str] = []
     seen_lines = set()
     seen_urls = set()
     seen_chunks = set()
@@ -320,9 +306,6 @@ def build_priority_contact_block(question: str, retrieved: List[Tuple[Chunk, flo
     }
 
 
-# ============================================================
-# LECTURA DE DOCUMENTOS
-# ============================================================
 def extract_text_from_txt(file_bytes: bytes) -> str:
     for encoding in ["utf-8", "latin-1", "cp1252"]:
         try:
@@ -443,14 +426,11 @@ def extract_chunks_generic_text(file_bytes: bytes, source_name: str, extension: 
     elif extension == ".pdf":
         raw_text = extract_text_from_pdf(file_bytes)
     else:
-        raise ValueError("Formato no soportado en lectura genérica.")
+        raise ValueError("Formato no soportado. Usa .docx, .pdf o .txt")
 
     return split_text_into_chunks(normalize_whitespace(raw_text), source_name, source_name)
 
 
-# ============================================================
-# EMBEDDINGS Y RECUPERACIÓN
-# ============================================================
 def build_embeddings(client: OpenAI, chunks: List[Chunk], embedding_model: str) -> np.ndarray:
     texts = [f"Título: {c.heading_path}\n\nContenido: {c.text}" for c in chunks]
     vectors = []
@@ -486,7 +466,7 @@ def retrieve_top_chunks(
 def boost_retrieval(question: str, retrieved: List[Tuple[Chunk, float]]) -> List[Tuple[Chunk, float]]:
     intent = detect_intent(question)
     wants_online = detect_online_preference(question)
-    boosted = []
+    boosted: List[Tuple[Chunk, float]] = []
 
     for chunk, score in retrieved:
         bonus = 0.0
@@ -520,9 +500,6 @@ def boost_retrieval(question: str, retrieved: List[Tuple[Chunk, float]]) -> List
     return boosted[:TOP_K]
 
 
-# ============================================================
-# RESPUESTA DEL MODELO
-# ============================================================
 def build_context_block(top_chunks: List[Tuple[Chunk, float]]) -> str:
     blocks = []
     for i, (chunk, score) in enumerate(top_chunks, start=1):
@@ -539,7 +516,7 @@ def build_context_block(top_chunks: List[Tuple[Chunk, float]]) -> str:
 def build_priority_notes(question: str, contact_block: Dict[str, List[str]]) -> str:
     intent = detect_intent(question)
     wants_online = detect_online_preference(question)
-    notes = []
+    notes: List[str] = []
 
     if intent == "critical_contact":
         notes.append("La consulta es crítica y debe priorizar contactos, teléfonos, enlaces y actuación inmediata.")
@@ -559,8 +536,7 @@ def build_priority_notes(question: str, contact_block: Dict[str, List[str]]) -> 
     elif intent == "complaint":
         notes.append("La consulta parece relacionada con reclamaciones, compensaciones o reembolsos. Prioriza reglas operativas y límites de actuación.")
 
-    return "
-".join(notes) if notes else "Ninguna prioridad adicional detectada."
+    return "\n".join(notes) if notes else "Ninguna prioridad adicional detectada."
 
 
 def ask_guidelines_assistant(
@@ -581,14 +557,8 @@ def ask_guidelines_assistant(
     language_instruction = {
         "english": "Respond only in English.",
         "portuguese": "Responda apenas em português.",
-        "spanish": "Responde únicamente en español."
+        "spanish": "Responde únicamente en español.",
     }[detected_language]
-
-    contact_display_rule = (
-        "Incluye el bloque 'Contacto inmediato' únicamente si la consulta requiere claramente un contacto o canal inmediato, "
-        "por ejemplo en urgencias, accidentes, salud, seguros o cuando el usuario pide explícitamente a quién llamar, contactar o qué enlace usar. "
-        "Si la consulta no requiere contacto específico, no incluyas ese bloque."
-    )
 
     instructions = (
         "Eres un asistente interno para guías de una empresa de viajes. "
@@ -600,53 +570,35 @@ def ask_guidelines_assistant(
         "Cuando la consulta trate sobre accidente, salud, urgencia, hospital, seguro o 'a quién llamo', debes priorizar el contacto aplicable. "
         "Si el usuario pregunta por una vía online, por internet, web o enlace, debes priorizar el enlace específico del caso si aparece en el contexto. "
         "No sustituyas un enlace médico específico por teléfonos o WhatsApps generales si el documento ofrece una vía online médica directa. "
-        f"{contact_display_rule} "
+        "Incluye el bloque 'Contacto inmediato' únicamente si la consulta requiere claramente un contacto o canal inmediato, por ejemplo en urgencias, accidentes, salud, seguros o cuando el usuario pide explícitamente a quién llamar, contactar o qué enlace usar. "
+        "Si la consulta no requiere contacto específico, no incluyas ese bloque. "
         "No añadas una sección final de fuentes o base documental en la respuesta visible al usuario. "
         "Si no hay contacto identificable y la consulta realmente requiere contacto, dilo expresamente y da solo los pasos indispensables."
     )
 
     focus_rule = (
-        "7. Si el usuario pide una vía por internet, online, web o enlace, prioriza el enlace web específico y no lo omitas si aparece en el contexto.
-"
-        if wants_online else
-        "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales.
-"
+        "7. Si el usuario pide una vía por internet, online, web o enlace, prioriza el enlace web específico y no lo omitas si aparece en el contexto.\n"
+        if wants_online
+        else "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales.\n"
     )
 
     contact_rule = (
-        "2. Incluye 'Contacto inmediato' solo si la consulta requiere un contacto o canal específico y el contexto aporta uno relevante.
-"
-        if has_relevant_contact and intent == "critical_contact" else
-        "2. No incluyas el bloque 'Contacto inmediato' salvo que sea realmente necesario para resolver la consulta.
-"
+        "2. Incluye 'Contacto inmediato' solo si la consulta requiere un contacto o canal específico y el contexto aporta uno relevante.\n"
+        if has_relevant_contact and intent == "critical_contact"
+        else "2. No incluyas el bloque 'Contacto inmediato' salvo que sea realmente necesario para resolver la consulta.\n"
     )
 
     user_input = (
-        f"CONSULTA DEL GUÍA:
-{question}
-
-"
-        f"PRIORIDADES OPERATIVAS:
-{priority_notes}
-
-"
-        f"CONTEXTO DOCUMENTAL DISPONIBLE:
-{context_block}
-
-"
-        "Reglas de salida obligatorias:
-"
-        "1. Respuesta preferente entre 0 y 150 palabras.
-"
+        f"CONSULTA DEL GUÍA:\n{question}\n\n"
+        f"PRIORIDADES OPERATIVAS:\n{priority_notes}\n\n"
+        f"CONTEXTO DOCUMENTAL DISPONIBLE:\n{context_block}\n\n"
+        "Reglas de salida obligatorias:\n"
+        "1. Respuesta preferente entre 70 y 150 palabras.\n"
         f"{contact_rule}"
-        "3. Si incluyes 'Contacto inmediato', coloca ahí el teléfono, enlace o canal útil.
-"
-        "4. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo, solo si aporta valor.
-"
-        "5. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.
-"
-        "6. No copies párrafos largos del contexto.
-"
+        "3. Si incluyes 'Contacto inmediato', coloca ahí el teléfono, enlace o canal útil.\n"
+        "4. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo, solo si aporta valor.\n"
+        "5. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.\n"
+        "6. No copies párrafos largos del contexto.\n"
         f"{focus_rule}"
         "8. Mantén toda la respuesta en el idioma detectado para la consulta, sin mezclar idiomas."
     )
@@ -661,9 +613,6 @@ def ask_guidelines_assistant(
     return response.output_text.strip()
 
 
-# ============================================================
-# ESTADO Y PROCESAMIENTO
-# ============================================================
 def initialize_cache_state() -> None:
     if "doc_cache" not in st.session_state:
         st.session_state.doc_cache = {}
@@ -679,7 +628,7 @@ def reset_chat_if_document_changed(current_hash: str) -> None:
         st.session_state.last_file_hash = current_hash
 
 
-def process_document(client: OpenAI, source_file, embedding_model: str):
+def process_document(client: OpenAI, source_file: RepoFile, embedding_model: str) -> Dict:
     file_bytes = source_file.read()
     file_hash = file_sha256(file_bytes)
     source_name = source_file.name
@@ -713,9 +662,6 @@ def process_document(client: OpenAI, source_file, embedding_model: str):
     return payload
 
 
-# ============================================================
-# INTERFAZ
-# ============================================================
 def render_css() -> None:
     st.markdown(
         """
@@ -728,18 +674,18 @@ def render_css() -> None:
     )
 
 
-def render_header():
+def render_header() -> None:
     st.title(APP_TITLE)
     st.caption(APP_SUBTITLE)
 
 
-def render_history():
+def render_history() -> None:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
 
-def main():
+def main() -> None:
     initialize_cache_state()
     render_css()
     render_header()
@@ -767,21 +713,22 @@ def main():
         st.stop()
 
     reset_chat_if_document_changed(doc_data["file_hash"])
-    render_history()    question = st.chat_input("Escribe la consulta del guía...")
+    render_history()
+
+    question = st.chat_input("Escribe la consulta del guía...")
 
     if question:
         st.session_state.messages.append({"role": "user", "content": question})
 
-        if not is_query_in_scope(question):        with st.chat_message("user"):
+        with st.chat_message("user"):
             st.markdown(question)
+
+        if not is_query_in_scope(question):
             out_of_scope_msg = "Este tema no corresponde a esta herramienta"
             with st.chat_message("assistant"):
                 st.markdown(out_of_scope_msg)
             st.session_state.messages.append({"role": "assistant", "content": out_of_scope_msg})
             return
-
-        with st.chat_message("user"):
-            st.markdown(question)
 
         with st.chat_message("assistant"):
             try:
