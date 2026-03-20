@@ -1,18 +1,16 @@
 import io
 import os
 import re
-import json
 import time
-import math
 import hashlib
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import streamlit as st
 from openai import OpenAI
 
-# Dependencias opcionales para lectura de documentos
+# Dependencias opcionales
 try:
     from docx import Document
 except Exception:
@@ -27,19 +25,23 @@ except Exception:
 # ============================================================
 # CONFIGURACIÓN GENERAL
 # ============================================================
-st.set_page_config(page_title="Asistente de Atención al Cliente para Guías", page_icon="📘", layout="wide")
+st.set_page_config(
+    page_title="Asistente de Atención al Cliente para Guías",
+    page_icon="📘",
+    layout="wide",
+)
 
 APP_TITLE = "📘 Asistente de Atención al Cliente para Guías"
-APP_SUBTITLE = "Consulta las pautas oficiales y responde según el idioma de la pregunta."
+APP_SUBTITLE = "Consulta las pautas oficiales y recibe respuestas directas, breves y accionables."
 DEFAULT_MODEL = "gpt-5-mini"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 MAX_CHUNK_CHARS = 1800
 CHUNK_OVERLAP_CHARS = 250
-TOP_K = 6
+TOP_K = 8
 
 
 # ============================================================
-# UTILIDADES
+# MODELOS DE DATOS
 # ============================================================
 @dataclass
 class Chunk:
@@ -49,6 +51,9 @@ class Chunk:
     source_name: str
 
 
+# ============================================================
+# UTILIDADES
+# ============================================================
 def normalize_whitespace(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"\r", "\n", text)
@@ -69,10 +74,53 @@ def cosine_similarity_matrix(query_vec: np.ndarray, matrix: np.ndarray) -> np.nd
 
 
 def safe_get_api_key() -> str:
-    secret_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
-    if secret_key:
-        return secret_key
-    return st.session_state.get("manual_api_key", "")
+    try:
+        secret_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        secret_key = ""
+    return secret_key
+
+
+def detect_priority_focus(question: str) -> str:
+    q = question.lower()
+
+    if any(term in q for term in [
+        "salud", "médic", "medic", "seguro", "hospital", "ambul", "emergenc", "enfermo", "enferma", "doente", "saúde"
+    ]):
+        return "health"
+
+    if any(term in q for term in [
+        "teléfono", "telefono", "phone", "número", "numero", "llamo", "llamar", "contacto", "contactar"
+    ]):
+        return "phone"
+
+    return "general"
+
+
+def extract_phone_lines(text: str) -> List[str]:
+    phone_patterns = [
+        r"\+?\d[\d\s\-()]{6,}\d",
+    ]
+
+    lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(re.search(pattern, line) for pattern in phone_patterns):
+            lines.append(line)
+            continue
+        if any(keyword in line.lower() for keyword in ["tel", "telefono", "teléfono", "phone", "whatsapp", "seguro", "asistencia"]):
+            lines.append(line)
+
+    dedup = []
+    seen = set()
+    for line in lines:
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            dedup.append(line)
+    return dedup[:8]
 
 
 # ============================================================
@@ -102,12 +150,42 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "".join(pages)
 
 
+def split_text_into_chunks(text: str, heading_path: str, source_name: str) -> List[Chunk]:
+    text = normalize_whitespace(text)
+    if not text:
+        return []
+
+    chunks: List[Chunk] = []
+    start = 0
+    text_len = len(text)
+
+    while start < text_len:
+        end = min(start + MAX_CHUNK_CHARS, text_len)
+        candidate = text[start:end]
+
+        if end < text_len:
+            last_break = max(candidate.rfind("\n\n"), candidate.rfind(". "), candidate.rfind("; "))
+            if last_break > int(MAX_CHUNK_CHARS * 0.55):
+                end = start + last_break + 1
+                candidate = text[start:end]
+
+        chunk_text = normalize_whitespace(candidate)
+        if chunk_text:
+            chunk_id = hashlib.md5(f"{heading_path}|{start}|{chunk_text[:80]}".encode("utf-8")).hexdigest()
+            chunks.append(Chunk(chunk_id=chunk_id, heading_path=heading_path, text=chunk_text, source_name=source_name))
+
+        if end >= text_len:
+            break
+        start = max(end - CHUNK_OVERLAP_CHARS, start + 1)
+
+    return chunks
+
+
 def extract_sections_from_docx(file_bytes: bytes, source_name: str) -> List[Chunk]:
     if Document is None:
         raise RuntimeError("Falta instalar python-docx para procesar archivos Word.")
 
     doc = Document(io.BytesIO(file_bytes))
-
     sections: List[Tuple[str, List[str]]] = []
     heading_stack = [source_name]
     current_lines: List[str] = []
@@ -142,8 +220,7 @@ def extract_sections_from_docx(file_bytes: bytes, source_name: str) -> List[Chun
                 heading_stack[level] = text
                 heading_stack = heading_stack[: level + 1]
 
-            heading_path = " > ".join([h for h in heading_stack if h])
-            last_heading_path = heading_path
+            last_heading_path = " > ".join([h for h in heading_stack if h])
         else:
             current_lines.append(text)
 
@@ -153,9 +230,8 @@ def extract_sections_from_docx(file_bytes: bytes, source_name: str) -> List[Chun
     chunks: List[Chunk] = []
     for heading_path, lines in sections:
         full_text = normalize_whitespace("\n".join(lines))
-        if not full_text:
-            continue
-        chunks.extend(split_text_into_chunks(full_text, heading_path, source_name))
+        if full_text:
+            chunks.extend(split_text_into_chunks(full_text, heading_path, source_name))
 
     if not chunks:
         raw_text = "\n".join([p.text for p in doc.paragraphs])
@@ -172,66 +248,19 @@ def extract_chunks_generic_text(file_bytes: bytes, source_name: str, extension: 
     else:
         raise ValueError("Formato no soportado en lectura genérica.")
 
-    raw_text = normalize_whitespace(raw_text)
-    return split_text_into_chunks(raw_text, source_name, source_name)
+    return split_text_into_chunks(normalize_whitespace(raw_text), source_name, source_name)
 
 
 # ============================================================
-# CHUNKING
-# ============================================================
-def split_text_into_chunks(text: str, heading_path: str, source_name: str) -> List[Chunk]:
-    text = normalize_whitespace(text)
-    if not text:
-        return []
-
-    chunks: List[Chunk] = []
-    start = 0
-    text_len = len(text)
-
-    while start < text_len:
-        end = min(start + MAX_CHUNK_CHARS, text_len)
-        candidate = text[start:end]
-
-        if end < text_len:
-            last_break = max(
-                candidate.rfind("\n\n"),
-                candidate.rfind(". "),
-                candidate.rfind("; "),
-            )
-            if last_break > int(MAX_CHUNK_CHARS * 0.55):
-                end = start + last_break + 1
-                candidate = text[start:end]
-
-        chunk_text = normalize_whitespace(candidate)
-        if chunk_text:
-            chunk_id = hashlib.md5(f"{heading_path}|{start}|{chunk_text[:80]}".encode("utf-8")).hexdigest()
-            chunks.append(
-                Chunk(
-                    chunk_id=chunk_id,
-                    heading_path=heading_path,
-                    text=chunk_text,
-                    source_name=source_name,
-                )
-            )
-
-        if end >= text_len:
-            break
-
-        start = max(end - CHUNK_OVERLAP_CHARS, start + 1)
-
-    return chunks
-
-
-# ============================================================
-# EMBEDDINGS
+# EMBEDDINGS Y RECUPERACIÓN
 # ============================================================
 def build_embeddings(client: OpenAI, chunks: List[Chunk], embedding_model: str) -> np.ndarray:
     texts = [f"Título: {c.heading_path}\n\nContenido: {c.text}" for c in chunks]
     vectors = []
-
     batch_size = 64
+
     for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
+        batch = texts[i:i + batch_size]
         resp = client.embeddings.create(model=embedding_model, input=batch)
         vectors.extend([item.embedding for item in resp.data])
 
@@ -243,21 +272,34 @@ def build_query_embedding(client: OpenAI, query: str, embedding_model: str) -> n
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
-# ============================================================
-# RECUPERACIÓN
-# ============================================================
-def retrieve_top_chunks(
-    client: OpenAI,
-    question: str,
-    chunks: List[Chunk],
-    embeddings: np.ndarray,
-    embedding_model: str,
-    top_k: int = TOP_K,
-) -> List[Tuple[Chunk, float]]:
+def retrieve_top_chunks(client: OpenAI, question: str, chunks: List[Chunk], embeddings: np.ndarray, embedding_model: str, top_k: int = TOP_K) -> List[Tuple[Chunk, float]]:
     query_vec = build_query_embedding(client, question, embedding_model)
     scores = cosine_similarity_matrix(query_vec, embeddings)
     idxs = np.argsort(scores)[::-1][:top_k]
     return [(chunks[i], float(scores[i])) for i in idxs]
+
+
+def rerank_for_priority(question: str, retrieved: List[Tuple[Chunk, float]]) -> List[Tuple[Chunk, float]]:
+    focus = detect_priority_focus(question)
+    reranked = []
+
+    for chunk, score in retrieved:
+        bonus = 0.0
+        text_low = f"{chunk.heading_path} {chunk.text}".lower()
+
+        if focus == "health":
+            for kw in ["seguro", "asistencia", "emergencia", "hospital", "médic", "medic", "ambul", "teléfono", "telefono"]:
+                if kw in text_low:
+                    bonus += 0.08
+        if focus in ["health", "phone"]:
+            phone_lines = extract_phone_lines(chunk.text)
+            if phone_lines:
+                bonus += 0.12
+
+        reranked.append((chunk, score + bonus))
+
+    reranked.sort(key=lambda x: x[1], reverse=True)
+    return reranked[:TOP_K]
 
 
 # ============================================================
@@ -276,34 +318,58 @@ def build_context_block(top_chunks: List[Tuple[Chunk, float]]) -> str:
     return "\n\n------------------------------\n\n".join(blocks)
 
 
-def ask_guidelines_assistant(
-    client: OpenAI,
-    question: str,
-    top_chunks: List[Tuple[Chunk, float]],
-    model_name: str,
-) -> str:
+def build_priority_notes(question: str, top_chunks: List[Tuple[Chunk, float]]) -> str:
+    focus = detect_priority_focus(question)
+    phone_lines = []
+    for chunk, _ in top_chunks:
+        phone_lines.extend(extract_phone_lines(chunk.text))
+
+    unique_phone_lines = []
+    seen = set()
+    for line in phone_lines:
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_phone_lines.append(line)
+
+    notes = []
+    if focus == "health":
+        notes.append("La consulta parece relacionada con salud o emergencia. Prioriza teléfonos, seguros, asistencia médica y pasos inmediatos.")
+    if focus in ["health", "phone"] and unique_phone_lines:
+        notes.append("Datos de contacto detectados en el contexto:")
+        for line in unique_phone_lines[:8]:
+            notes.append(f"- {line}")
+    return "\n".join(notes)
+
+
+def ask_guidelines_assistant(client: OpenAI, question: str, top_chunks: List[Tuple[Chunk, float]], model_name: str) -> str:
     context_block = build_context_block(top_chunks)
+    priority_notes = build_priority_notes(question, top_chunks)
 
     instructions = (
         "Eres un asistente interno para guías de una empresa de viajes. "
         "Tu única fuente válida es el contexto documental proporcionado. "
-        "No inventes políticas ni procedimientos. "
-        "Si la respuesta no está suficientemente respaldada por el contexto, dilo de forma explícita. "
+        "No inventes políticas, teléfonos, procesos ni excepciones. "
         "Debes responder en el mismo idioma en que el usuario formule la consulta. "
-        "Si el usuario pregunta en portugués, responde en portugués; si pregunta en español, responde en español; "
-        "si pregunta en inglés, responde en inglés. "
-        "Estructura la respuesta de forma clara y operativa para un guía en servicio. "
-        "Al final, añade una sección breve llamada 'Base documental' con las rutas o títulos de los fragmentos utilizados."
+        "La respuesta debe ser breve, directa y operativa. "
+        "Empieza siempre con la respuesta principal en 1 o 2 frases. "
+        "Después, añade solo los pasos indispensables. "
+        "Si en el contexto aparece un teléfono, seguro, número de asistencia o contacto aplicable, colócalo al principio de la respuesta. "
+        "No desarrolles explicaciones largas salvo que sean necesarias para no omitir algo importante. "
+        "Si el contexto no permite identificar un teléfono o una instrucción exacta, dilo claramente. "
+        "Al final, añade una sección breve llamada 'Base documental' con las rutas utilizadas."
     )
 
     user_input = (
         f"CONSULTA DEL GUÍA:\n{question}\n\n"
+        f"PRIORIDADES OPERATIVAS:\n{priority_notes if priority_notes else 'Ninguna prioridad adicional detectada.'}\n\n"
         f"CONTEXTO DOCUMENTAL DISPONIBLE:\n{context_block}\n\n"
-        "Instrucciones adicionales:\n"
-        "1. Responde solo con base en lo que aparece en el contexto.\n"
-        "2. Si hay ambigüedad, indícalo.\n"
-        "3. Prioriza una redacción práctica y accionable.\n"
-        "4. No menciones información técnica sobre embeddings, chunks o recuperación."
+        "Reglas de salida:\n"
+        "1. Máximo preferente de 120 a 170 palabras, salvo que el contexto exija algo más.\n"
+        "2. Si hay un dato crítico inmediato, como un teléfono o contacto, colócalo en la primera línea.\n"
+        "3. Usa viñetas solo si ayudan a la acción.\n"
+        "4. No repitas el contenido del contexto.\n"
+        "5. No menciones aspectos técnicos sobre embeddings, chunks o recuperación."
     )
 
     response = client.responses.create(
@@ -316,7 +382,7 @@ def ask_guidelines_assistant(
 
 
 # ============================================================
-# CACHE DE DOCUMENTO PROCESADO
+# ESTADO Y PROCESAMIENTO
 # ============================================================
 def initialize_cache_state() -> None:
     if "doc_cache" not in st.session_state:
@@ -330,8 +396,8 @@ def process_document(client: OpenAI, uploaded_file, embedding_model: str):
     file_hash = file_sha256(file_bytes)
     source_name = uploaded_file.name
     extension = os.path.splitext(source_name)[1].lower()
-
     cache_key = f"{file_hash}|{embedding_model}"
+
     if cache_key in st.session_state.doc_cache:
         return st.session_state.doc_cache[cache_key]
 
@@ -362,164 +428,117 @@ def process_document(client: OpenAI, uploaded_file, embedding_model: str):
 # ============================================================
 # INTERFAZ
 # ============================================================
-def render_sidebar():
-    st.sidebar.header("Configuración")
-
-    if not st.secrets.get("OPENAI_API_KEY", ""):
-        st.sidebar.text_input(
-            "OpenAI API Key",
-            type="password",
-            key="manual_api_key",
-            help="Si no está en secrets.toml, introdúcela aquí.",
-        )
-    else:
-        st.sidebar.success("API key cargada desde secrets.toml")
-
-    model_name = st.sidebar.selectbox(
-        "Modelo de respuesta",
-        ["gpt-5-mini", "gpt-5", "gpt-4.1-mini"],
-        index=0,
-    )
-
-    embedding_model = st.sidebar.selectbox(
-        "Modelo de embeddings",
-        ["text-embedding-3-small", "text-embedding-3-large"],
-        index=0,
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.info(
-        "Recomendación operativa: usa el documento maestro en formato .docx. "
-        "Si hoy lo tienes en Google Docs, expórtalo a Word para preservar mejor la jerarquía del índice y los títulos."
-    )
-
-    return model_name, embedding_model
-
-
 def render_header():
     st.title(APP_TITLE)
     st.caption(APP_SUBTITLE)
 
-    with st.expander("Enfoque recomendado", expanded=False):
-        st.markdown(
-            """
-**Qué hace esta app**
-- Toma tu documento de pautas como base documental.
-- Divide el contenido por secciones y fragmentos.
-- Busca los pasajes más relevantes para cada consulta.
-- Responde únicamente con base en esos pasajes.
-- Contesta en el idioma de la pregunta del guía.
 
-**Formato recomendado del documento**
-- Mejor opción: **.docx** con estilos de títulos bien aplicados.
-- Alternativa válida: **.pdf**.
-- Menos recomendable: texto plano.
+def render_document_status(doc_data: dict):
+    c1, c2 = st.columns([0.7, 0.3])
+    with c1:
+        st.info(f"Documento activo: **{doc_data['source_name']}**")
+    with c2:
+        st.metric("Fragmentos indexados", len(doc_data["chunks"]))
 
-**Uso sugerido**
-1. Carga el documento maestro.
-2. Espera a que la indexación termine.
-3. Escribe una consulta como lo haría un guía.
-4. Revisa la respuesta y la base documental utilizada.
-            """
-        )
+
+def render_history():
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
 
 def main():
     initialize_cache_state()
     render_header()
-    model_name, embedding_model = render_sidebar()
 
     api_key = safe_get_api_key()
     if not api_key:
-        st.warning("Introduce tu API key en la barra lateral o configúrala en secrets.toml para continuar.")
+        st.error("No se encontró OPENAI_API_KEY en secrets.toml.")
         st.stop()
 
     client = OpenAI(api_key=api_key)
+    model_name = DEFAULT_MODEL
+    embedding_model = DEFAULT_EMBEDDING_MODEL
 
-    col1, col2 = st.columns([0.42, 0.58])
+    top_col1, top_col2 = st.columns([0.62, 0.38])
 
-    with col1:
-        st.subheader("Documento base")
+    with top_col1:
         uploaded_file = st.file_uploader(
-            "Carga el documento maestro",
+            "Carga el documento base",
             type=["docx", "pdf", "txt"],
-            help="Para máxima calidad de recuperación, usa Word (.docx).",
+            help="Para mejor calidad, usa Word (.docx) con títulos bien estructurados.",
         )
 
-        if uploaded_file is not None:
-            try:
-                with st.spinner("Procesando documento e indexando contenido..."):
-                    doc_data = process_document(client, uploaded_file, embedding_model)
-                st.success("Documento procesado correctamente.")
-                st.metric("Fragmentos indexados", len(doc_data["chunks"]))
-                st.caption(f"Documento: {doc_data['source_name']}")
-            except Exception as e:
-                st.error(f"No se pudo procesar el documento: {e}")
-                st.stop()
-        else:
-            st.info("Carga el documento para habilitar el asistente.")
-
-        with st.expander("Ejemplos de consulta", expanded=False):
+    with top_col2:
+        with st.expander("Información del asistente", expanded=False):
             st.markdown(
                 """
-- ¿Qué debo hacer si un pasajero reclama por una excursión no incluida?
-- Como devo proceder se um cliente perder a ligação do transfer?
-- What should I do if a customer asks for compensation on the spot?
-- ¿Qué corresponde informar cuando hay un cambio de hotel de último momento?
+- Responde con base en el documento cargado.
+- Prioriza respuestas directas y accionables.
+- Si la consulta está en portugués o inglés, responde en ese idioma.
                 """
             )
 
-    with col2:
-        st.subheader("Chat operativo")
+    if uploaded_file is None:
+        st.info("Carga el documento para comenzar a consultar.")
+        st.stop()
 
-        if uploaded_file is None:
-            st.stop()
+    try:
+        with st.spinner("Procesando documento..."):
+            doc_data = process_document(client, uploaded_file, embedding_model)
+    except Exception as e:
+        st.error(f"No se pudo procesar el documento: {e}")
+        st.stop()
 
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+    render_document_status(doc_data)
+    st.markdown("---")
 
-        question = st.chat_input("Escribe la consulta del guía...")
+    chat_container = st.container()
+    with chat_container:
+        render_history()
 
-        if question:
-            st.session_state.messages.append({"role": "user", "content": question})
-            with st.chat_message("user"):
-                st.markdown(question)
+    question = st.chat_input("Escribe la consulta del guía...")
 
-            with st.chat_message("assistant"):
-                try:
-                    with st.spinner("Consultando la base documental..."):
-                        top_chunks = retrieve_top_chunks(
-                            client=client,
-                            question=question,
-                            chunks=doc_data["chunks"],
-                            embeddings=doc_data["embeddings"],
-                            embedding_model=embedding_model,
-                            top_k=TOP_K,
-                        )
-                        answer = ask_guidelines_assistant(
-                            client=client,
-                            question=question,
-                            top_chunks=top_chunks,
-                            model_name=model_name,
-                        )
+    if question:
+        st.session_state.messages.append({"role": "user", "content": question})
 
-                    st.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
+        with st.chat_message("user"):
+            st.markdown(question)
 
-                    with st.expander("Fragmentos utilizados", expanded=False):
-                        for i, (chunk, score) in enumerate(top_chunks, start=1):
-                            st.markdown(f"**{i}. {chunk.heading_path}**")
-                            st.caption(f"Relevancia: {score:.4f}")
-                            st.write(chunk.text)
-                            st.markdown("---")
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("Consultando la base documental..."):
+                    retrieved = retrieve_top_chunks(
+                        client=client,
+                        question=question,
+                        chunks=doc_data["chunks"],
+                        embeddings=doc_data["embeddings"],
+                        embedding_model=embedding_model,
+                        top_k=TOP_K,
+                    )
+                    top_chunks = rerank_for_priority(question, retrieved)
+                    answer = ask_guidelines_assistant(
+                        client=client,
+                        question=question,
+                        top_chunks=top_chunks,
+                        model_name=model_name,
+                    )
 
-                except Exception as e:
-                    error_msg = f"Se produjo un error al generar la respuesta: {e}"
-                    st.error(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+
+                with st.expander("Base utilizada", expanded=False):
+                    for i, (chunk, score) in enumerate(top_chunks[:5], start=1):
+                        st.markdown(f"**{i}. {chunk.heading_path}**")
+                        st.caption(f"Relevancia: {score:.4f}")
+                        st.write(chunk.text)
+                        st.markdown("---")
+
+            except Exception as e:
+                error_msg = f"Se produjo un error al generar la respuesta: {e}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
 
 if __name__ == "__main__":
     main()
-
