@@ -33,12 +33,13 @@ st.set_page_config(
 
 APP_TITLE = "📘 Asistente de Atención al Cliente para Guías"
 APP_SUBTITLE = "Consultas operativas basadas exclusivamente en el documento vigente."
-DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_MODEL = "gpt-5.1"
+DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 MAX_CHUNK_CHARS = 1700
 CHUNK_OVERLAP_CHARS = 220
-TOP_K = 8
-CONTACTS_TOP_K = 10
+TOP_K = 10
+CONTACTS_TOP_K = 12
 REPO_DOC_PATH = "pautasattguias.gpt.docx"
 
 
@@ -92,25 +93,31 @@ def safe_get_api_key() -> str:
         return ""
 
 
+def normalize_for_match(text: str) -> str:
+    return normalize_whitespace(text).lower()
+
+
 # ============================================================
 # DETECCIÓN DE INTENCIÓN
 # ============================================================
 def detect_intent(question: str) -> str:
     q = question.lower()
 
-    health_terms = [
+    critical_terms = [
         "accidente", "salud", "médic", "medic", "hospital", "ambul", "emergenc", "urgenc",
-        "seguro", "asistencia", "enfermo", "enferma", "doente", "saúde", "acidente"
-    ]
-    phone_terms = [
-        "a quién llamo", "a quien llamo", "a dónde llamo", "adónde llamo", "telefono", "teléfono",
-        "número", "numero", "contacto", "llamar", "llamo", "phone"
+        "seguro", "asistencia", "enfermo", "enferma", "doente", "saúde", "acidente",
+        "a quién llamo", "a quien llamo", "a dónde llamo", "adónde llamo", "telefono",
+        "teléfono", "número", "numero", "contacto", "llamar", "llamo", "phone"
     ]
 
-    if any(term in q for term in health_terms):
+    complaint_terms = [
+        "reclam", "queja", "complaint", "compens", "reembolso", "refund", "indemn"
+    ]
+
+    if any(term in q for term in critical_terms):
         return "critical_contact"
-    if any(term in q for term in phone_terms):
-        return "critical_contact"
+    if any(term in q for term in complaint_terms):
+        return "complaint"
     return "general"
 
 
@@ -139,11 +146,11 @@ def extract_phone_lines(text: str) -> List[str]:
     dedup = []
     seen = set()
     for line in lines:
-        key = line.lower()
+        key = normalize_for_match(line)
         if key not in seen:
             seen.add(key)
             dedup.append(line)
-    return dedup[:12]
+    return dedup[:15]
 
 
 def score_contact_relevance(question: str, chunk: Chunk) -> float:
@@ -153,7 +160,7 @@ def score_contact_relevance(question: str, chunk: Chunk) -> float:
 
     heading_keywords = [
         "contactos críticos", "contactos", "emergencia", "seguro", "europ assistance",
-        "actuación inmediata", "asistencia médica", "mi viaje"
+        "actuación inmediata", "asistencia médica", "mi viaje", "accidente"
     ]
     for kw in heading_keywords:
         if kw in text:
@@ -197,14 +204,14 @@ def build_priority_contact_block(question: str, retrieved: List[Tuple[Chunk, flo
             seen_chunks.add(chunk.chunk_id)
             contact_chunks.append(chunk.heading_path)
         for line in lines:
-            key = line.lower()
+            key = normalize_for_match(line)
             if key not in seen_lines:
                 seen_lines.add(key)
                 contact_lines.append(line)
 
     return {
-        "contact_lines": contact_lines[:10],
-        "contact_chunks": contact_chunks[:5],
+        "contact_lines": contact_lines[:12],
+        "contact_chunks": contact_chunks[:6],
     }
 
 
@@ -381,10 +388,15 @@ def boost_retrieval(question: str, retrieved: List[Tuple[Chunk, float]]) -> List
 
         if intent == "critical_contact":
             if any(k in text for k in ["contactos críticos", "contactos", "europ assistance", "seguro", "asistencia médica", "actuación inmediata"]):
-                bonus += 0.14
-            if extract_phone_lines(chunk.text):
                 bonus += 0.16
+            if extract_phone_lines(chunk.text):
+                bonus += 0.18
             for kw in ["accidente", "salud", "hospital", "emergencia", "urgencia", "ambul", "seguro"]:
+                if kw in text:
+                    bonus += 0.07
+
+        elif intent == "complaint":
+            for kw in ["reclam", "compens", "reembolso", "cuestionario", "atención al cliente"]:
                 if kw in text:
                     bonus += 0.06
 
@@ -418,10 +430,13 @@ def build_priority_notes(question: str, contact_block: Dict[str, List[str]]) -> 
         notes.append("La consulta es crítica y debe priorizar contactos, teléfonos y actuación inmediata.")
         if contact_block["contact_lines"]:
             notes.append("Contactos potencialmente relevantes detectados:")
-            for line in contact_block["contact_lines"][:8]:
+            for line in contact_block["contact_lines"][:10]:
                 notes.append(f"- {line}")
         else:
             notes.append("No se detectaron teléfonos claros en los fragmentos priorizados.")
+
+    elif intent == "complaint":
+        notes.append("La consulta parece relacionada con reclamaciones, compensaciones o reembolsos. Prioriza reglas operativas y límites de actuación.")
 
     return "\n".join(notes) if notes else "Ninguna prioridad adicional detectada."
 
@@ -432,6 +447,7 @@ def ask_guidelines_assistant(
     top_chunks: List[Tuple[Chunk, float]],
     contact_block: Dict[str, List[str]],
     model_name: str,
+    reasoning_effort: str,
 ) -> str:
     context_block = build_context_block(top_chunks)
     priority_notes = build_priority_notes(question, contact_block)
@@ -441,7 +457,8 @@ def ask_guidelines_assistant(
         "Tu única fuente válida es el contexto documental proporcionado. "
         "No inventes políticas, procesos, teléfonos ni excepciones. "
         "Debes responder en el mismo idioma en que el usuario formule la consulta. "
-        "La respuesta debe ser breve, directa, operativa y útil para actuar de inmediato. "
+        "La respuesta debe ser breve, precisa, operativa y útil para actuar de inmediato. "
+        "Analiza bien el contexto antes de responder y prioriza el dato más accionable. "
         "Cuando la consulta trate sobre accidente, salud, urgencia, hospital, seguro o 'a quién llamo', "
         "debes priorizar el contacto aplicable y colocarlo en la primera línea si está presente en el contexto. "
         "Si existen varios contactos, muestra primero el más directamente relacionado con el caso. "
@@ -456,16 +473,18 @@ def ask_guidelines_assistant(
         f"PRIORIDADES OPERATIVAS:\n{priority_notes}\n\n"
         f"CONTEXTO DOCUMENTAL DISPONIBLE:\n{context_block}\n\n"
         "Reglas de salida obligatorias:\n"
-        "1. Respuesta preferente entre 80 y 160 palabras.\n"
+        "1. Respuesta preferente entre 70 y 150 palabras.\n"
         "2. Si hay un teléfono o contacto útil, ponlo en la primera línea bajo el rótulo 'Contacto inmediato'.\n"
         "3. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo.\n"
         "4. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.\n"
         "5. No copies párrafos largos del contexto.\n"
-        "6. No añadas recomendaciones externas no contenidas en el documento."
+        "6. No añadas recomendaciones externas no contenidas en el documento.\n"
+        "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales."
     )
 
     response = client.responses.create(
         model=model_name,
+        reasoning={"effort": reasoning_effort},
         instructions=instructions,
         input=user_input,
     )
@@ -533,15 +552,7 @@ def render_css() -> None:
         """
         <style>
             [data-testid="stSidebar"] {display: none;}
-            .block-container {padding-top: 1.4rem; padding-bottom: 5rem; max-width: 1050px;}
-            .doc-status {
-                border: 1px solid rgba(49, 51, 63, 0.2);
-                border-radius: 12px;
-                padding: 0.75rem 1rem;
-                margin-bottom: 0.8rem;
-                background: rgba(240, 242, 246, 0.35);
-            }
-            .doc-status strong {font-weight: 700;}
+            .block-container {padding-top: 1.4rem; padding-bottom: 5rem; max-width: 1000px;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -575,6 +586,7 @@ def main():
 
     client = OpenAI(api_key=api_key)
     model_name = DEFAULT_MODEL
+    reasoning_effort = DEFAULT_REASONING_EFFORT
     embedding_model = DEFAULT_EMBEDDING_MODEL
     repo_file = RepoFile(REPO_DOC_PATH)
 
@@ -586,7 +598,6 @@ def main():
         st.stop()
 
     reset_chat_if_document_changed(doc_data["file_hash"])
-
     render_history()
 
     question = st.chat_input("Escribe la consulta del guía...")
@@ -616,6 +627,7 @@ def main():
                         top_chunks=top_chunks,
                         contact_block=contact_block,
                         model_name=model_name,
+                        reasoning_effort=reasoning_effort,
                     )
 
                 st.markdown(answer)
