@@ -4,7 +4,7 @@ import re
 import time
 import hashlib
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import streamlit as st
@@ -32,12 +32,13 @@ st.set_page_config(
 )
 
 APP_TITLE = "📘 Asistente de Atención al Cliente para Guías"
-APP_SUBTITLE = "Consulta las pautas oficiales y recibe respuestas directas, breves y accionables."
+APP_SUBTITLE = "Consultas operativas basadas exclusivamente en el documento vigente."
 DEFAULT_MODEL = "gpt-5-mini"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-MAX_CHUNK_CHARS = 1800
-CHUNK_OVERLAP_CHARS = 250
+MAX_CHUNK_CHARS = 1700
+CHUNK_OVERLAP_CHARS = 220
 TOP_K = 8
+CONTACTS_TOP_K = 10
 
 
 # ============================================================
@@ -75,42 +76,57 @@ def cosine_similarity_matrix(query_vec: np.ndarray, matrix: np.ndarray) -> np.nd
 
 def safe_get_api_key() -> str:
     try:
-        secret_key = st.secrets.get("OPENAI_API_KEY", "")
+        return st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
-        secret_key = ""
-    return secret_key
+        return ""
 
 
-def detect_priority_focus(question: str) -> str:
+def hash_text(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# DETECCIÓN DE INTENCIÓN
+# ============================================================
+def detect_intent(question: str) -> str:
     q = question.lower()
 
-    if any(term in q for term in [
-        "salud", "médic", "medic", "seguro", "hospital", "ambul", "emergenc", "enfermo", "enferma", "doente", "saúde"
-    ]):
-        return "health"
+    health_terms = [
+        "accidente", "salud", "médic", "medic", "hospital", "ambul", "emergenc", "urgenc",
+        "seguro", "asistencia", "enfermo", "enferma", "doente", "saúde", "acidente"
+    ]
+    phone_terms = [
+        "a quién llamo", "a quien llamo", "a dónde llamo", "adónde llamo", "telefono", "teléfono",
+        "número", "numero", "contacto", "llamar", "llamo", "phone"
+    ]
 
-    if any(term in q for term in [
-        "teléfono", "telefono", "phone", "número", "numero", "llamo", "llamar", "contacto", "contactar"
-    ]):
-        return "phone"
-
+    if any(term in q for term in health_terms):
+        return "critical_contact"
+    if any(term in q for term in phone_terms):
+        return "critical_contact"
     return "general"
 
 
+# ============================================================
+# EXTRACCIÓN DE TELÉFONOS Y CONTACTOS
+# ============================================================
 def extract_phone_lines(text: str) -> List[str]:
-    phone_patterns = [
-        r"\+?\d[\d\s\-()]{6,}\d",
-    ]
-
     lines = []
+    phone_pattern = r"\+?\d[\d\s\-()]{6,}\d"
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if any(re.search(pattern, line) for pattern in phone_patterns):
-            lines.append(line)
-            continue
-        if any(keyword in line.lower() for keyword in ["tel", "telefono", "teléfono", "phone", "whatsapp", "seguro", "asistencia"]):
+
+        low = line.lower()
+        has_phone = re.search(phone_pattern, line) is not None
+        has_contact_word = any(k in low for k in [
+            "tel", "telefono", "teléfono", "phone", "whatsapp", "asistencia", "seguro",
+            "europ assistance", "europassistance", "emergencia", "contacto", "24/7"
+        ])
+
+        if has_phone or has_contact_word:
             lines.append(line)
 
     dedup = []
@@ -120,7 +136,69 @@ def extract_phone_lines(text: str) -> List[str]:
         if key not in seen:
             seen.add(key)
             dedup.append(line)
-    return dedup[:8]
+    return dedup[:12]
+
+
+def score_contact_relevance(question: str, chunk: Chunk) -> float:
+    q = question.lower()
+    text = f"{chunk.heading_path}\n{chunk.text}".lower()
+    score = 0.0
+
+    heading_keywords = [
+        "contactos críticos", "contactos", "emergencia", "seguro", "europ assistance",
+        "actuación inmediata", "asistencia médica", "mi viaje"
+    ]
+    for kw in heading_keywords:
+        if kw in text:
+            score += 0.12
+
+    if any(k in q for k in ["accidente", "salud", "hospital", "médic", "medic", "seguro", "urgenc", "emergenc"]):
+        for kw in ["europ assistance", "seguro", "asistencia médica", "ambul", "hospital", "urgencia", "emergencia"]:
+            if kw in text:
+                score += 0.08
+
+    if any(k in q for k in ["llamo", "telefono", "teléfono", "contacto", "numero", "número"]):
+        for kw in ["tel", "telefono", "teléfono", "contacto", "whatsapp", "24/7"]:
+            if kw in text:
+                score += 0.08
+
+    if extract_phone_lines(chunk.text):
+        score += 0.18
+
+    return score
+
+
+def build_priority_contact_block(question: str, retrieved: List[Tuple[Chunk, float]]) -> Dict[str, List[str]]:
+    intent = detect_intent(question)
+    if intent != "critical_contact":
+        return {"contact_lines": [], "contact_chunks": []}
+
+    rescored = []
+    for chunk, base_score in retrieved:
+        rescored.append((chunk, base_score + score_contact_relevance(question, chunk)))
+
+    rescored.sort(key=lambda x: x[1], reverse=True)
+
+    contact_lines = []
+    contact_chunks = []
+    seen_lines = set()
+    seen_chunks = set()
+
+    for chunk, _score in rescored[:CONTACTS_TOP_K]:
+        lines = extract_phone_lines(chunk.text)
+        if lines and chunk.chunk_id not in seen_chunks:
+            seen_chunks.add(chunk.chunk_id)
+            contact_chunks.append(chunk.heading_path)
+        for line in lines:
+            key = line.lower()
+            if key not in seen_lines:
+                seen_lines.add(key)
+                contact_lines.append(line)
+
+    return {
+        "contact_lines": contact_lines[:10],
+        "contact_chunks": contact_chunks[:5],
+    }
 
 
 # ============================================================
@@ -272,34 +350,41 @@ def build_query_embedding(client: OpenAI, query: str, embedding_model: str) -> n
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
-def retrieve_top_chunks(client: OpenAI, question: str, chunks: List[Chunk], embeddings: np.ndarray, embedding_model: str, top_k: int = TOP_K) -> List[Tuple[Chunk, float]]:
+def retrieve_top_chunks(
+    client: OpenAI,
+    question: str,
+    chunks: List[Chunk],
+    embeddings: np.ndarray,
+    embedding_model: str,
+    top_k: int = TOP_K,
+) -> List[Tuple[Chunk, float]]:
     query_vec = build_query_embedding(client, question, embedding_model)
     scores = cosine_similarity_matrix(query_vec, embeddings)
     idxs = np.argsort(scores)[::-1][:top_k]
     return [(chunks[i], float(scores[i])) for i in idxs]
 
 
-def rerank_for_priority(question: str, retrieved: List[Tuple[Chunk, float]]) -> List[Tuple[Chunk, float]]:
-    focus = detect_priority_focus(question)
-    reranked = []
+def boost_retrieval(question: str, retrieved: List[Tuple[Chunk, float]]) -> List[Tuple[Chunk, float]]:
+    intent = detect_intent(question)
+    boosted = []
 
     for chunk, score in retrieved:
         bonus = 0.0
-        text_low = f"{chunk.heading_path} {chunk.text}".lower()
+        text = f"{chunk.heading_path}\n{chunk.text}".lower()
 
-        if focus == "health":
-            for kw in ["seguro", "asistencia", "emergencia", "hospital", "médic", "medic", "ambul", "teléfono", "telefono"]:
-                if kw in text_low:
-                    bonus += 0.08
-        if focus in ["health", "phone"]:
-            phone_lines = extract_phone_lines(chunk.text)
-            if phone_lines:
-                bonus += 0.12
+        if intent == "critical_contact":
+            if any(k in text for k in ["contactos críticos", "contactos", "europ assistance", "seguro", "asistencia médica", "actuación inmediata"]):
+                bonus += 0.14
+            if extract_phone_lines(chunk.text):
+                bonus += 0.16
+            for kw in ["accidente", "salud", "hospital", "emergencia", "urgencia", "ambul", "seguro"]:
+                if kw in text:
+                    bonus += 0.06
 
-        reranked.append((chunk, score + bonus))
+        boosted.append((chunk, score + bonus))
 
-    reranked.sort(key=lambda x: x[1], reverse=True)
-    return reranked[:TOP_K]
+    boosted.sort(key=lambda x: x[1], reverse=True)
+    return boosted[:TOP_K]
 
 
 # ============================================================
@@ -318,58 +403,57 @@ def build_context_block(top_chunks: List[Tuple[Chunk, float]]) -> str:
     return "\n\n------------------------------\n\n".join(blocks)
 
 
-def build_priority_notes(question: str, top_chunks: List[Tuple[Chunk, float]]) -> str:
-    focus = detect_priority_focus(question)
-    phone_lines = []
-    for chunk, _ in top_chunks:
-        phone_lines.extend(extract_phone_lines(chunk.text))
-
-    unique_phone_lines = []
-    seen = set()
-    for line in phone_lines:
-        key = line.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_phone_lines.append(line)
-
+def build_priority_notes(question: str, top_chunks: List[Tuple[Chunk, float]], contact_block: Dict[str, List[str]]) -> str:
+    intent = detect_intent(question)
     notes = []
-    if focus == "health":
-        notes.append("La consulta parece relacionada con salud o emergencia. Prioriza teléfonos, seguros, asistencia médica y pasos inmediatos.")
-    if focus in ["health", "phone"] and unique_phone_lines:
-        notes.append("Datos de contacto detectados en el contexto:")
-        for line in unique_phone_lines[:8]:
-            notes.append(f"- {line}")
-    return "\n".join(notes)
+
+    if intent == "critical_contact":
+        notes.append("La consulta es crítica y debe priorizar contactos, teléfonos y actuación inmediata.")
+        if contact_block["contact_lines"]:
+            notes.append("Contactos potencialmente relevantes detectados:")
+            for line in contact_block["contact_lines"][:8]:
+                notes.append(f"- {line}")
+        else:
+            notes.append("No se detectaron teléfonos claros en los fragmentos priorizados.")
+
+    return "\n".join(notes) if notes else "Ninguna prioridad adicional detectada."
 
 
-def ask_guidelines_assistant(client: OpenAI, question: str, top_chunks: List[Tuple[Chunk, float]], model_name: str) -> str:
+def ask_guidelines_assistant(
+    client: OpenAI,
+    question: str,
+    top_chunks: List[Tuple[Chunk, float]],
+    contact_block: Dict[str, List[str]],
+    model_name: str,
+) -> str:
     context_block = build_context_block(top_chunks)
-    priority_notes = build_priority_notes(question, top_chunks)
+    priority_notes = build_priority_notes(question, top_chunks, contact_block)
 
     instructions = (
         "Eres un asistente interno para guías de una empresa de viajes. "
         "Tu única fuente válida es el contexto documental proporcionado. "
-        "No inventes políticas, teléfonos, procesos ni excepciones. "
+        "No inventes políticas, procesos, teléfonos ni excepciones. "
         "Debes responder en el mismo idioma en que el usuario formule la consulta. "
-        "La respuesta debe ser breve, directa y operativa. "
-        "Empieza siempre con la respuesta principal en 1 o 2 frases. "
-        "Después, añade solo los pasos indispensables. "
-        "Si en el contexto aparece un teléfono, seguro, número de asistencia o contacto aplicable, colócalo al principio de la respuesta. "
-        "No desarrolles explicaciones largas salvo que sean necesarias para no omitir algo importante. "
-        "Si el contexto no permite identificar un teléfono o una instrucción exacta, dilo claramente. "
-        "Al final, añade una sección breve llamada 'Base documental' con las rutas utilizadas."
+        "La respuesta debe ser breve, directa, operativa y útil para actuar de inmediato. "
+        "Cuando la consulta trate sobre accidente, salud, urgencia, hospital, seguro o 'a quién llamo', "
+        "debes priorizar el contacto aplicable y colocarlo en la primera línea si está presente en el contexto. "
+        "Si existen varios contactos, muestra primero el más directamente relacionado con el caso. "
+        "No redactes párrafos extensos. Usa el siguiente formato, siempre que el contexto lo permita: "
+        "'Contacto inmediato', 'Qué hacer ahora' y 'Base documental'. "
+        "Si no hay teléfono identificable, dilo expresamente y da solo los pasos indispensables."
     )
 
     user_input = (
         f"CONSULTA DEL GUÍA:\n{question}\n\n"
-        f"PRIORIDADES OPERATIVAS:\n{priority_notes if priority_notes else 'Ninguna prioridad adicional detectada.'}\n\n"
+        f"PRIORIDADES OPERATIVAS:\n{priority_notes}\n\n"
         f"CONTEXTO DOCUMENTAL DISPONIBLE:\n{context_block}\n\n"
-        "Reglas de salida:\n"
-        "1. Máximo preferente de 120 a 170 palabras, salvo que el contexto exija algo más.\n"
-        "2. Si hay un dato crítico inmediato, como un teléfono o contacto, colócalo en la primera línea.\n"
-        "3. Usa viñetas solo si ayudan a la acción.\n"
-        "4. No repitas el contenido del contexto.\n"
-        "5. No menciones aspectos técnicos sobre embeddings, chunks o recuperación."
+        "Reglas de salida obligatorias:\n"
+        "1. Respuesta preferente entre 80 y 160 palabras.\n"
+        "2. Si hay un teléfono o contacto útil, ponlo en la primera línea bajo el rótulo 'Contacto inmediato'.\n"
+        "3. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo.\n"
+        "4. Cierra con 'Base documental' y menciona solo las rutas utilizadas.\n"
+        "5. No copies párrafos largos del contexto.\n"
+        "6. No añadas recomendaciones externas no contenidas en el documento."
     )
 
     response = client.responses.create(
@@ -389,6 +473,14 @@ def initialize_cache_state() -> None:
         st.session_state.doc_cache = {}
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "last_file_hash" not in st.session_state:
+        st.session_state.last_file_hash = None
+
+
+def reset_chat_if_document_changed(current_hash: str) -> None:
+    if st.session_state.last_file_hash != current_hash:
+        st.session_state.messages = []
+        st.session_state.last_file_hash = current_hash
 
 
 def process_document(client: OpenAI, uploaded_file, embedding_model: str):
@@ -428,17 +520,41 @@ def process_document(client: OpenAI, uploaded_file, embedding_model: str):
 # ============================================================
 # INTERFAZ
 # ============================================================
+def render_css() -> None:
+    st.markdown(
+        """
+        <style>
+            [data-testid="stSidebar"] {display: none;}
+            .block-container {padding-top: 1.4rem; padding-bottom: 5rem; max-width: 1050px;}
+            .doc-status {
+                border: 1px solid rgba(49, 51, 63, 0.2);
+                border-radius: 12px;
+                padding: 0.75rem 1rem;
+                margin-bottom: 0.8rem;
+                background: rgba(240, 242, 246, 0.35);
+            }
+            .doc-status strong {font-weight: 700;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_header():
     st.title(APP_TITLE)
     st.caption(APP_SUBTITLE)
 
 
 def render_document_status(doc_data: dict):
-    c1, c2 = st.columns([0.7, 0.3])
-    with c1:
-        st.info(f"Documento activo: **{doc_data['source_name']}**")
-    with c2:
-        st.metric("Fragmentos indexados", len(doc_data["chunks"]))
+    st.markdown(
+        f"""
+        <div class="doc-status">
+            <strong>Documento activo:</strong> {doc_data['source_name']}<br>
+            <strong>Fragmentos indexados:</strong> {len(doc_data['chunks'])}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_history():
@@ -449,6 +565,7 @@ def render_history():
 
 def main():
     initialize_cache_state()
+    render_css()
     render_header()
 
     api_key = safe_get_api_key()
@@ -460,24 +577,11 @@ def main():
     model_name = DEFAULT_MODEL
     embedding_model = DEFAULT_EMBEDDING_MODEL
 
-    top_col1, top_col2 = st.columns([0.62, 0.38])
-
-    with top_col1:
-        uploaded_file = st.file_uploader(
-            "Carga el documento base",
-            type=["docx", "pdf", "txt"],
-            help="Para mejor calidad, usa Word (.docx) con títulos bien estructurados.",
-        )
-
-    with top_col2:
-        with st.expander("Información del asistente", expanded=False):
-            st.markdown(
-                """
-- Responde con base en el documento cargado.
-- Prioriza respuestas directas y accionables.
-- Si la consulta está en portugués o inglés, responde en ese idioma.
-                """
-            )
+    uploaded_file = st.file_uploader(
+        "Carga el documento base",
+        type=["docx", "pdf", "txt"],
+        help="Para mejor calidad, utiliza Word (.docx) con títulos bien estructurados.",
+    )
 
     if uploaded_file is None:
         st.info("Carga el documento para comenzar a consultar.")
@@ -490,12 +594,20 @@ def main():
         st.error(f"No se pudo procesar el documento: {e}")
         st.stop()
 
+    reset_chat_if_document_changed(doc_data["file_hash"])
     render_document_status(doc_data)
-    st.markdown("---")
 
-    chat_container = st.container()
-    with chat_container:
-        render_history()
+    with st.expander("Cómo responde el asistente", expanded=False):
+        st.markdown(
+            """
+- Responde exclusivamente con base en el documento cargado.
+- Prioriza respuestas breves y accionables.
+- En consultas de accidente, salud o emergencia, intenta mostrar primero el contacto aplicable.
+- Responde en el idioma en que se formule la pregunta.
+            """
+        )
+
+    render_history()
 
     question = st.chat_input("Escribe la consulta del guía...")
 
@@ -516,11 +628,13 @@ def main():
                         embedding_model=embedding_model,
                         top_k=TOP_K,
                     )
-                    top_chunks = rerank_for_priority(question, retrieved)
+                    top_chunks = boost_retrieval(question, retrieved)
+                    contact_block = build_priority_contact_block(question, top_chunks)
                     answer = ask_guidelines_assistant(
                         client=client,
                         question=question,
                         top_chunks=top_chunks,
+                        contact_block=contact_block,
                         model_name=model_name,
                     )
 
@@ -528,9 +642,15 @@ def main():
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
                 with st.expander("Base utilizada", expanded=False):
+                    if contact_block["contact_lines"]:
+                        st.markdown("**Contactos detectados**")
+                        for line in contact_block["contact_lines"]:
+                            st.write(f"- {line}")
+                        st.markdown("---")
+
                     for i, (chunk, score) in enumerate(top_chunks[:5], start=1):
                         st.markdown(f"**{i}. {chunk.heading_path}**")
-                        st.caption(f"Relevancia: {score:.4f}")
+                        st.caption(f"Relevancia ajustada: {score:.4f}")
                         st.write(chunk.text)
                         st.markdown("---")
 
