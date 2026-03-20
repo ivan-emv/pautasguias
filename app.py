@@ -130,6 +130,50 @@ def detect_online_preference(question: str) -> bool:
     return any(term in q for term in online_terms)
 
 
+def detect_query_language(question: str) -> str:
+    q = question.strip().lower()
+
+    english_markers = [
+        "what", "how", "who", "where", "when", "should", "can i", "do i", "passenger", "customer",
+        "medical", "urgent", "help", "call", "internet", "online", "luggage", "refund"
+    ]
+    portuguese_markers = [
+        "você", "voce", "passageiro", "ligar", "internet", "saúde", "saude", "reembolso",
+        "bagagem", "ônibus", "onibus", "como", "onde", "quando", "precisa", "preciso", "devo"
+    ]
+
+    english_score = sum(1 for m in english_markers if m in q)
+    portuguese_score = sum(1 for m in portuguese_markers if m in q)
+
+    if english_score > portuguese_score and english_score > 0:
+        return "english"
+    if portuguese_score > english_score and portuguese_score > 0:
+        return "portuguese"
+    return "spanish"
+
+
+def is_query_in_scope(question: str) -> bool:
+    q = question.lower().strip()
+
+    travel_scope_terms = [
+        "pasajero", "passenger", "cliente", "customer", "guía", "guia", "guide", "tour", "circuito",
+        "hotel", "traslado", "transfer", "equipaje", "luggage", "maleta", "bagagem", "seguro",
+        "assistance", "asistencia", "atención al cliente", "customer service", "reclam", "queja", "compens",
+        "reembolso", "refund", "accidente", "salud", "medical", "médic", "medic", "hospital",
+        "emergenc", "urgenc", "pickup", "meeting point", "coordinator", "coordinador", "localizador"
+    ]
+
+    obviously_out_of_scope = [
+        "2x2", "capital de", "capital of", "weather", "clima", "tiempo mañana", "football", "fútbol",
+        "recipe", "receta", "programming", "python code", "who won", "cuánto es", "cuanto es"
+    ]
+
+    if any(term in q for term in obviously_out_of_scope):
+        return False
+
+    return any(term in q for term in travel_scope_terms)
+
+
 # ============================================================
 # EXTRACCIÓN DE TELÉFONOS, ENLACES Y CONTACTOS
 # ============================================================
@@ -515,7 +559,8 @@ def build_priority_notes(question: str, contact_block: Dict[str, List[str]]) -> 
     elif intent == "complaint":
         notes.append("La consulta parece relacionada con reclamaciones, compensaciones o reembolsos. Prioriza reglas operativas y límites de actuación.")
 
-    return "\n".join(notes) if notes else "Ninguna prioridad adicional detectada."
+    return "
+".join(notes) if notes else "Ninguna prioridad adicional detectada."
 
 
 def ask_guidelines_assistant(
@@ -529,42 +574,81 @@ def ask_guidelines_assistant(
     context_block = build_context_block(top_chunks)
     priority_notes = build_priority_notes(question, contact_block)
     wants_online = detect_online_preference(question)
+    detected_language = detect_query_language(question)
+    intent = detect_intent(question)
+    has_relevant_contact = bool(contact_block.get("contact_lines") or contact_block.get("url_lines"))
+
+    language_instruction = {
+        "english": "Respond only in English.",
+        "portuguese": "Responda apenas em português.",
+        "spanish": "Responde únicamente en español."
+    }[detected_language]
+
+    contact_display_rule = (
+        "Incluye el bloque 'Contacto inmediato' únicamente si la consulta requiere claramente un contacto o canal inmediato, "
+        "por ejemplo en urgencias, accidentes, salud, seguros o cuando el usuario pide explícitamente a quién llamar, contactar o qué enlace usar. "
+        "Si la consulta no requiere contacto específico, no incluyas ese bloque."
+    )
 
     instructions = (
         "Eres un asistente interno para guías de una empresa de viajes. "
         "Tu única fuente válida es el contexto documental proporcionado. "
         "No inventes políticas, procesos, teléfonos, enlaces ni excepciones. "
-        "Debes responder en el mismo idioma en que el usuario formule la consulta. "
+        f"{language_instruction} "
         "La respuesta debe ser breve, precisa, operativa y útil para actuar de inmediato. "
         "Analiza bien el contexto antes de responder y prioriza el dato más accionable. "
-        "Cuando la consulta trate sobre accidente, salud, urgencia, hospital, seguro o 'a quién llamo', "
-        "debes priorizar el contacto aplicable y colocarlo en la primera línea si está presente en el contexto. "
+        "Cuando la consulta trate sobre accidente, salud, urgencia, hospital, seguro o 'a quién llamo', debes priorizar el contacto aplicable. "
         "Si el usuario pregunta por una vía online, por internet, web o enlace, debes priorizar el enlace específico del caso si aparece en el contexto. "
         "No sustituyas un enlace médico específico por teléfonos o WhatsApps generales si el documento ofrece una vía online médica directa. "
-        "Si existen varios contactos, muestra primero el más directamente relacionado con el caso. "
-        "No redactes párrafos extensos. Usa el siguiente formato, siempre que el contexto lo permita: 'Contacto inmediato' y 'Qué hacer ahora'. "
+        f"{contact_display_rule} "
         "No añadas una sección final de fuentes o base documental en la respuesta visible al usuario. "
-        "Si no hay contacto identificable, dilo expresamente y da solo los pasos indispensables."
+        "Si no hay contacto identificable y la consulta realmente requiere contacto, dilo expresamente y da solo los pasos indispensables."
     )
 
     focus_rule = (
-        "7. Si el usuario pide una vía por internet, online, web o enlace, prioriza el enlace web específico y no lo omitas si aparece en el contexto.\n"
+        "7. Si el usuario pide una vía por internet, online, web o enlace, prioriza el enlace web específico y no lo omitas si aparece en el contexto.
+"
         if wants_online else
-        "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales.\n"
+        "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales.
+"
+    )
+
+    contact_rule = (
+        "2. Incluye 'Contacto inmediato' solo si la consulta requiere un contacto o canal específico y el contexto aporta uno relevante.
+"
+        if has_relevant_contact and intent == "critical_contact" else
+        "2. No incluyas el bloque 'Contacto inmediato' salvo que sea realmente necesario para resolver la consulta.
+"
     )
 
     user_input = (
-        f"CONSULTA DEL GUÍA:\n{question}\n\n"
-        f"PRIORIDADES OPERATIVAS:\n{priority_notes}\n\n"
-        f"CONTEXTO DOCUMENTAL DISPONIBLE:\n{context_block}\n\n"
-        "Reglas de salida obligatorias:\n"
-        "1. Respuesta preferente entre 70 y 150 palabras.\n"
-        "2. Si hay un teléfono, enlace o contacto útil, ponlo en la primera línea bajo el rótulo 'Contacto inmediato'.\n"
-        "3. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo.\n"
-        "4. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.\n"
-        "5. No copies párrafos largos del contexto.\n"
-        "6. No añadas recomendaciones externas no contenidas en el documento.\n"
+        f"CONSULTA DEL GUÍA:
+{question}
+
+"
+        f"PRIORIDADES OPERATIVAS:
+{priority_notes}
+
+"
+        f"CONTEXTO DOCUMENTAL DISPONIBLE:
+{context_block}
+
+"
+        "Reglas de salida obligatorias:
+"
+        "1. Respuesta preferente entre 0 y 150 palabras.
+"
+        f"{contact_rule}"
+        "3. Si incluyes 'Contacto inmediato', coloca ahí el teléfono, enlace o canal útil.
+"
+        "4. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo, solo si aporta valor.
+"
+        "5. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.
+"
+        "6. No copies párrafos largos del contexto.
+"
         f"{focus_rule}"
+        "8. Mantén toda la respuesta en el idioma detectado para la consulta, sin mezclar idiomas."
     )
 
     response = client.responses.create(
@@ -683,12 +767,18 @@ def main():
         st.stop()
 
     reset_chat_if_document_changed(doc_data["file_hash"])
-    render_history()
-
-    question = st.chat_input("Escribe la consulta del guía...")
+    render_history()    question = st.chat_input("Escribe la consulta del guía...")
 
     if question:
         st.session_state.messages.append({"role": "user", "content": question})
+
+        if not is_query_in_scope(question):        with st.chat_message("user"):
+            st.markdown(question)
+            out_of_scope_msg = "Este tema no corresponde a esta herramienta"
+            with st.chat_message("assistant"):
+                st.markdown(out_of_scope_msg)
+            st.session_state.messages.append({"role": "assistant", "content": out_of_scope_msg})
+            return
 
         with st.chat_message("user"):
             st.markdown(question)
