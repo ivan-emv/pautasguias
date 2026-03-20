@@ -39,6 +39,7 @@ MAX_CHUNK_CHARS = 1700
 CHUNK_OVERLAP_CHARS = 220
 TOP_K = 8
 CONTACTS_TOP_K = 10
+REPO_DOC_PATH = "pautasattguias.gpt.docx"
 
 
 # ============================================================
@@ -50,6 +51,16 @@ class Chunk:
     heading_path: str
     text: str
     source_name: str
+
+
+class RepoFile:
+    def __init__(self, path: str):
+        self.path = path
+        self.name = os.path.basename(path)
+
+    def read(self) -> bytes:
+        with open(self.path, "rb") as f:
+            return f.read()
 
 
 # ============================================================
@@ -79,10 +90,6 @@ def safe_get_api_key() -> str:
         return st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
         return ""
-
-
-def hash_text(text: str) -> str:
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
 # ============================================================
@@ -403,7 +410,7 @@ def build_context_block(top_chunks: List[Tuple[Chunk, float]]) -> str:
     return "\n\n------------------------------\n\n".join(blocks)
 
 
-def build_priority_notes(question: str, top_chunks: List[Tuple[Chunk, float]], contact_block: Dict[str, List[str]]) -> str:
+def build_priority_notes(question: str, contact_block: Dict[str, List[str]]) -> str:
     intent = detect_intent(question)
     notes = []
 
@@ -427,7 +434,7 @@ def ask_guidelines_assistant(
     model_name: str,
 ) -> str:
     context_block = build_context_block(top_chunks)
-    priority_notes = build_priority_notes(question, top_chunks, contact_block)
+    priority_notes = build_priority_notes(question, contact_block)
 
     instructions = (
         "Eres un asistente interno para guías de una empresa de viajes. "
@@ -439,7 +446,8 @@ def ask_guidelines_assistant(
         "debes priorizar el contacto aplicable y colocarlo en la primera línea si está presente en el contexto. "
         "Si existen varios contactos, muestra primero el más directamente relacionado con el caso. "
         "No redactes párrafos extensos. Usa el siguiente formato, siempre que el contexto lo permita: "
-        "'Contacto inmediato', 'Qué hacer ahora' y 'Base documental'. "
+        "'Contacto inmediato' y 'Qué hacer ahora'. "
+        "No añadas una sección final de fuentes o base documental en la respuesta visible al usuario. "
         "Si no hay teléfono identificable, dilo expresamente y da solo los pasos indispensables."
     )
 
@@ -451,7 +459,7 @@ def ask_guidelines_assistant(
         "1. Respuesta preferente entre 80 y 160 palabras.\n"
         "2. Si hay un teléfono o contacto útil, ponlo en la primera línea bajo el rótulo 'Contacto inmediato'.\n"
         "3. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo.\n"
-        "4. Cierra con 'Base documental' y menciona solo las rutas utilizadas.\n"
+        "4. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.\n"
         "5. No copies párrafos largos del contexto.\n"
         "6. No añadas recomendaciones externas no contenidas en el documento."
     )
@@ -483,10 +491,10 @@ def reset_chat_if_document_changed(current_hash: str) -> None:
         st.session_state.last_file_hash = current_hash
 
 
-def process_document(client: OpenAI, uploaded_file, embedding_model: str):
-    file_bytes = uploaded_file.read()
+def process_document(client: OpenAI, source_file, embedding_model: str):
+    file_bytes = source_file.read()
     file_hash = file_sha256(file_bytes)
-    source_name = uploaded_file.name
+    source_name = source_file.name
     extension = os.path.splitext(source_name)[1].lower()
     cache_key = f"{file_hash}|{embedding_model}"
 
@@ -573,23 +581,18 @@ def main():
         st.error("No se encontró OPENAI_API_KEY en secrets.toml.")
         st.stop()
 
+    if not os.path.exists(REPO_DOC_PATH):
+        st.error(f"No se encontró el documento en el repositorio: {REPO_DOC_PATH}")
+        st.stop()
+
     client = OpenAI(api_key=api_key)
     model_name = DEFAULT_MODEL
     embedding_model = DEFAULT_EMBEDDING_MODEL
-
-    uploaded_file = st.file_uploader(
-        "Carga el documento base",
-        type=["docx", "pdf", "txt"],
-        help="Para mejor calidad, utiliza Word (.docx) con títulos bien estructurados.",
-    )
-
-    if uploaded_file is None:
-        st.info("Carga el documento para comenzar a consultar.")
-        st.stop()
+    repo_file = RepoFile(REPO_DOC_PATH)
 
     try:
         with st.spinner("Procesando documento..."):
-            doc_data = process_document(client, uploaded_file, embedding_model)
+            doc_data = process_document(client, repo_file, embedding_model)
     except Exception as e:
         st.error(f"No se pudo procesar el documento: {e}")
         st.stop()
@@ -600,7 +603,7 @@ def main():
     with st.expander("Cómo responde el asistente", expanded=False):
         st.markdown(
             """
-- Responde exclusivamente con base en el documento cargado.
+- Responde exclusivamente con base en el documento del repositorio.
 - Prioriza respuestas breves y accionables.
 - En consultas de accidente, salud o emergencia, intenta mostrar primero el contacto aplicable.
 - Responde en el idioma en que se formule la pregunta.
@@ -640,19 +643,6 @@ def main():
 
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
-
-                with st.expander("Base utilizada", expanded=False):
-                    if contact_block["contact_lines"]:
-                        st.markdown("**Contactos detectados**")
-                        for line in contact_block["contact_lines"]:
-                            st.write(f"- {line}")
-                        st.markdown("---")
-
-                    for i, (chunk, score) in enumerate(top_chunks[:5], start=1):
-                        st.markdown(f"**{i}. {chunk.heading_path}**")
-                        st.caption(f"Relevancia ajustada: {score:.4f}")
-                        st.write(chunk.text)
-                        st.markdown("---")
 
             except Exception as e:
                 error_msg = f"Se produjo un error al generar la respuesta: {e}"
