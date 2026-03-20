@@ -121,8 +121,17 @@ def detect_intent(question: str) -> str:
     return "general"
 
 
+def detect_online_preference(question: str) -> bool:
+    q = question.lower()
+    online_terms = [
+        "internet", "online", "enlace", "link", "web", "por internet",
+        "llamada por internet", "llamar por internet", "solicitar llamada", "app", "sitio"
+    ]
+    return any(term in q for term in online_terms)
+
+
 # ============================================================
-# EXTRACCIÓN DE TELÉFONOS Y CONTACTOS
+# EXTRACCIÓN DE TELÉFONOS, ENLACES Y CONTACTOS
 # ============================================================
 def extract_phone_lines(text: str) -> List[str]:
     lines = []
@@ -153,10 +162,40 @@ def extract_phone_lines(text: str) -> List[str]:
     return dedup[:15]
 
 
+def extract_url_lines(text: str) -> List[str]:
+    lines = []
+    url_pattern = r"https?://\S+"
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        low = line.lower()
+        has_url = re.search(url_pattern, line) is not None
+        has_online_word = any(k in low for k in [
+            "web", "enlace", "link", "internet", "online", "quickassistance", "eclaims",
+            "solicitar una llamada", "llamada por internet"
+        ])
+
+        if has_url or has_online_word:
+            lines.append(line)
+
+    dedup = []
+    seen = set()
+    for line in lines:
+        key = normalize_for_match(line)
+        if key not in seen:
+            seen.add(key)
+            dedup.append(line)
+    return dedup[:15]
+
+
 def score_contact_relevance(question: str, chunk: Chunk) -> float:
     q = question.lower()
     text = f"{chunk.heading_path}\n{chunk.text}".lower()
     score = 0.0
+    wants_online = detect_online_preference(question)
 
     heading_keywords = [
         "contactos críticos", "contactos", "emergencia", "seguro", "europ assistance",
@@ -179,13 +218,23 @@ def score_contact_relevance(question: str, chunk: Chunk) -> float:
     if extract_phone_lines(chunk.text):
         score += 0.18
 
+    if extract_url_lines(chunk.text):
+        score += 0.10
+
+    if wants_online:
+        for kw in ["web", "quickassistance", "eclaims", "llamada por internet", "solicitar una llamada", "online", "internet"]:
+            if kw in text:
+                score += 0.16
+        if extract_url_lines(chunk.text):
+            score += 0.22
+
     return score
 
 
 def build_priority_contact_block(question: str, retrieved: List[Tuple[Chunk, float]]) -> Dict[str, List[str]]:
     intent = detect_intent(question)
     if intent != "critical_contact":
-        return {"contact_lines": [], "contact_chunks": []}
+        return {"contact_lines": [], "url_lines": [], "contact_chunks": []}
 
     rescored = []
     for chunk, base_score in retrieved:
@@ -194,23 +243,35 @@ def build_priority_contact_block(question: str, retrieved: List[Tuple[Chunk, flo
     rescored.sort(key=lambda x: x[1], reverse=True)
 
     contact_lines = []
+    url_lines = []
     contact_chunks = []
     seen_lines = set()
+    seen_urls = set()
     seen_chunks = set()
 
     for chunk, _score in rescored[:CONTACTS_TOP_K]:
-        lines = extract_phone_lines(chunk.text)
-        if lines and chunk.chunk_id not in seen_chunks:
+        phones = extract_phone_lines(chunk.text)
+        urls = extract_url_lines(chunk.text)
+
+        if (phones or urls) and chunk.chunk_id not in seen_chunks:
             seen_chunks.add(chunk.chunk_id)
             contact_chunks.append(chunk.heading_path)
-        for line in lines:
+
+        for line in phones:
             key = normalize_for_match(line)
             if key not in seen_lines:
                 seen_lines.add(key)
                 contact_lines.append(line)
 
+        for line in urls:
+            key = normalize_for_match(line)
+            if key not in seen_urls:
+                seen_urls.add(key)
+                url_lines.append(line)
+
     return {
         "contact_lines": contact_lines[:12],
+        "url_lines": url_lines[:10],
         "contact_chunks": contact_chunks[:6],
     }
 
@@ -380,6 +441,7 @@ def retrieve_top_chunks(
 
 def boost_retrieval(question: str, retrieved: List[Tuple[Chunk, float]]) -> List[Tuple[Chunk, float]]:
     intent = detect_intent(question)
+    wants_online = detect_online_preference(question)
     boosted = []
 
     for chunk, score in retrieved:
@@ -391,9 +453,17 @@ def boost_retrieval(question: str, retrieved: List[Tuple[Chunk, float]]) -> List
                 bonus += 0.16
             if extract_phone_lines(chunk.text):
                 bonus += 0.18
+            if extract_url_lines(chunk.text):
+                bonus += 0.12
             for kw in ["accidente", "salud", "hospital", "emergencia", "urgencia", "ambul", "seguro"]:
                 if kw in text:
                     bonus += 0.07
+            if wants_online:
+                for kw in ["web", "quickassistance", "eclaims", "llamada por internet", "solicitar una llamada", "online", "internet"]:
+                    if kw in text:
+                        bonus += 0.20
+                if extract_url_lines(chunk.text):
+                    bonus += 0.20
 
         elif intent == "complaint":
             for kw in ["reclam", "compens", "reembolso", "cuestionario", "atención al cliente"]:
@@ -424,16 +494,23 @@ def build_context_block(top_chunks: List[Tuple[Chunk, float]]) -> str:
 
 def build_priority_notes(question: str, contact_block: Dict[str, List[str]]) -> str:
     intent = detect_intent(question)
+    wants_online = detect_online_preference(question)
     notes = []
 
     if intent == "critical_contact":
-        notes.append("La consulta es crítica y debe priorizar contactos, teléfonos y actuación inmediata.")
+        notes.append("La consulta es crítica y debe priorizar contactos, teléfonos, enlaces y actuación inmediata.")
+        if wants_online:
+            notes.append("El usuario pide una vía online o por internet. Prioriza enlaces web o canales online específicos antes que teléfonos alternativos no médicos.")
+        if contact_block["url_lines"]:
+            notes.append("Enlaces potencialmente relevantes detectados:")
+            for line in contact_block["url_lines"][:6]:
+                notes.append(f"- {line}")
         if contact_block["contact_lines"]:
             notes.append("Contactos potencialmente relevantes detectados:")
-            for line in contact_block["contact_lines"][:10]:
+            for line in contact_block["contact_lines"][:8]:
                 notes.append(f"- {line}")
-        else:
-            notes.append("No se detectaron teléfonos claros en los fragmentos priorizados.")
+        if not contact_block["contact_lines"] and not contact_block["url_lines"]:
+            notes.append("No se detectaron contactos claros en los fragmentos priorizados.")
 
     elif intent == "complaint":
         notes.append("La consulta parece relacionada con reclamaciones, compensaciones o reembolsos. Prioriza reglas operativas y límites de actuación.")
@@ -451,21 +528,29 @@ def ask_guidelines_assistant(
 ) -> str:
     context_block = build_context_block(top_chunks)
     priority_notes = build_priority_notes(question, contact_block)
+    wants_online = detect_online_preference(question)
 
     instructions = (
         "Eres un asistente interno para guías de una empresa de viajes. "
         "Tu única fuente válida es el contexto documental proporcionado. "
-        "No inventes políticas, procesos, teléfonos ni excepciones. "
+        "No inventes políticas, procesos, teléfonos, enlaces ni excepciones. "
         "Debes responder en el mismo idioma en que el usuario formule la consulta. "
         "La respuesta debe ser breve, precisa, operativa y útil para actuar de inmediato. "
         "Analiza bien el contexto antes de responder y prioriza el dato más accionable. "
         "Cuando la consulta trate sobre accidente, salud, urgencia, hospital, seguro o 'a quién llamo', "
         "debes priorizar el contacto aplicable y colocarlo en la primera línea si está presente en el contexto. "
+        "Si el usuario pregunta por una vía online, por internet, web o enlace, debes priorizar el enlace específico del caso si aparece en el contexto. "
+        "No sustituyas un enlace médico específico por teléfonos o WhatsApps generales si el documento ofrece una vía online médica directa. "
         "Si existen varios contactos, muestra primero el más directamente relacionado con el caso. "
-        "No redactes párrafos extensos. Usa el siguiente formato, siempre que el contexto lo permita: "
-        "'Contacto inmediato' y 'Qué hacer ahora'. "
+        "No redactes párrafos extensos. Usa el siguiente formato, siempre que el contexto lo permita: 'Contacto inmediato' y 'Qué hacer ahora'. "
         "No añadas una sección final de fuentes o base documental en la respuesta visible al usuario. "
-        "Si no hay teléfono identificable, dilo expresamente y da solo los pasos indispensables."
+        "Si no hay contacto identificable, dilo expresamente y da solo los pasos indispensables."
+    )
+
+    focus_rule = (
+        "7. Si el usuario pide una vía por internet, online, web o enlace, prioriza el enlace web específico y no lo omitas si aparece en el contexto.\n"
+        if wants_online else
+        "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales.\n"
     )
 
     user_input = (
@@ -474,12 +559,12 @@ def ask_guidelines_assistant(
         f"CONTEXTO DOCUMENTAL DISPONIBLE:\n{context_block}\n\n"
         "Reglas de salida obligatorias:\n"
         "1. Respuesta preferente entre 70 y 150 palabras.\n"
-        "2. Si hay un teléfono o contacto útil, ponlo en la primera línea bajo el rótulo 'Contacto inmediato'.\n"
+        "2. Si hay un teléfono, enlace o contacto útil, ponlo en la primera línea bajo el rótulo 'Contacto inmediato'.\n"
         "3. Después incluye 'Qué hacer ahora' con 2 a 4 viñetas como máximo.\n"
         "4. No añadas una sección final de fuentes o base documental en la respuesta visible al usuario.\n"
         "5. No copies párrafos largos del contexto.\n"
         "6. No añadas recomendaciones externas no contenidas en el documento.\n"
-        "7. Si el contexto contiene un dato directo y evidente, priorízalo sobre explicaciones generales."
+        f"{focus_rule}"
     )
 
     response = client.responses.create(
