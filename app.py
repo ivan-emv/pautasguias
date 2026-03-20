@@ -587,16 +587,6 @@ def main():
 
     reset_chat_if_document_changed(doc_data["file_hash"])
 
-    with st.expander("Cómo responde el asistente", expanded=False):
-        st.markdown(
-            """
-- Responde exclusivamente con base en el documento del repositorio.
-- Prioriza respuestas breves y accionables.
-- En consultas de accidente, salud o emergencia, intenta mostrar primero el contacto aplicable.
-- Responde en el idioma en que se formule la pregunta.
-            """
-        )
-
     render_history()
 
     question = st.chat_input("Escribe la consulta del guía...")
